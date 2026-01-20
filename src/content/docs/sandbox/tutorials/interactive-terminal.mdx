@@ -1,0 +1,640 @@
+---
+title: Build an interactive terminal
+description: Create real-time terminal applications using PTY (pseudo-terminal) functionality in Cloudflare Sandbox.
+sidebar:
+  order: 8
+---
+
+import { TypeScriptExample, PackageManagers, WranglerConfig } from "~/components";
+
+This tutorial shows how to build interactive terminal applications using Cloudflare Sandbox's PTY (pseudo-terminal) functionality. You will create a web-based terminal that provides real-time command execution with proper terminal emulation.
+
+## What you will learn
+
+- How to create and manage PTY sessions
+- Building real-time terminal UIs with WebSocket streaming
+- Handling terminal input/output and resize events
+- Implementing collaborative terminal sharing
+
+## Prerequisites
+
+- Cloudflare account with Workers and Containers enabled
+- Node.js 18 or later installed locally
+- Basic knowledge of TypeScript and React
+
+## Project setup
+
+Create a new project directory and initialize it:
+
+<PackageManagers
+  type="create"
+  pkg="cloudflare"
+  args={["create", "my-terminal-app", "--template", "web"]}
+/>
+
+Navigate to your project and install dependencies:
+
+<PackageManagers
+  type="exec"
+  pkg="npm install @cloudflare/sandbox xterm @xterm/addon-fit @xterm/addon-web-links"
+/>
+
+## Configure Wrangler
+
+Update your `wrangler.toml` to include the Sandbox binding:
+
+<WranglerConfig>
+
+```toml
+name = "my-terminal-app"
+compatibility_date = "2024-01-01"
+
+[env.dev]
+[[env.dev.durable_objects.bindings]]
+name = "Sandbox"
+class_name = "Container"
+script_name = "containers"
+```
+
+</WranglerConfig>
+
+## Create the Worker backend
+
+Create `src/index.ts` for your Worker:
+
+<TypeScriptExample>
+
+```ts
+import { getSandbox } from '@cloudflare/sandbox';
+
+export default {
+  async fetch(request, env, ctx): Promise<Response> {
+    const url = new URL(request.url);
+    
+    // Handle WebSocket connections for terminal streaming
+    if (url.pathname === '/ws' && request.headers.get('Upgrade') === 'websocket') {
+      return handleWebSocket(request, env);
+    }
+    
+    // Handle terminal creation
+    if (url.pathname === '/api/terminal' && request.method === 'POST') {
+      return handleCreateTerminal(request, env);
+    }
+    
+    // Serve static files or your frontend
+    return new Response('Terminal App', { headers: { 'Content-Type': 'text/html' } });
+  },
+} satisfies ExportedHandler<Env>;
+
+async function handleCreateTerminal(request: Request, env: Env): Promise<Response> {
+  const { cols, rows } = await request.json();
+  
+  // Get sandbox instance
+  const sandbox = getSandbox(env.Sandbox, 'terminal-sandbox');
+  
+  // Create PTY session
+  const pty = await sandbox.pty.create({
+    cols: cols || 80,
+    rows: rows || 24,
+    command: ['bash']
+  });
+  
+  return Response.json({ 
+    success: true, 
+    ptyId: pty.id,
+    message: 'Terminal created successfully'
+  });
+}
+
+async function handleWebSocket(request: Request, env: Env): Promise<Response> {
+  const webSocketPair = new WebSocketPair();
+  const [client, server] = Object.values(webSocketPair);
+  
+  server.accept();
+  
+  // Set up PTY connection when client sends ptyId
+  server.addEventListener('message', async (event) => {
+    const message = JSON.parse(event.data as string);
+    
+    if (message.type === 'connect' && message.ptyId) {
+      await setupPtyConnection(server, message.ptyId, env);
+    }
+  });
+  
+  return new Response(null, {
+    status: 101,
+    webSocket: client,
+  });
+}
+
+async function setupPtyConnection(websocket: WebSocket, ptyId: string, env: Env) {
+  const sandbox = getSandbox(env.Sandbox, 'terminal-sandbox');
+  
+  try {
+    // Get existing PTY
+    const pty = await sandbox.pty.getById(ptyId);
+    
+    // Forward PTY output to WebSocket
+    pty.onData((data) => {
+      websocket.send(JSON.stringify({
+        type: 'output',
+        data: data
+      }));
+    });
+    
+    // Handle PTY exit
+    pty.onExit((exitCode) => {
+      websocket.send(JSON.stringify({
+        type: 'exit',
+        exitCode: exitCode
+      }));
+    });
+    
+    // Handle WebSocket messages (terminal input)
+    websocket.addEventListener('message', async (event) => {
+      const message = JSON.parse(event.data as string);
+      
+      switch (message.type) {
+        case 'input':
+          await pty.write(message.data);
+          break;
+          
+        case 'resize':
+          await pty.resize(message.cols, message.rows);
+          break;
+      }
+    });
+    
+  } catch (error) {
+    websocket.send(JSON.stringify({
+      type: 'error',
+      message: error.message
+    }));
+  }
+}
+
+interface Env {
+  Sandbox: DurableObjectNamespace;
+}
+```
+
+</TypeScriptExample>
+
+## Build the frontend terminal
+
+Create `src/terminal.html` for the terminal interface:
+
+<TypeScriptExample>
+
+```html
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Interactive Terminal</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5/css/xterm.css" />
+    <style>
+        body {
+            margin: 0;
+            padding: 20px;
+            background: #1a1a1a;
+            color: white;
+            font-family: monospace;
+        }
+        .terminal-container {
+            background: #000;
+            border-radius: 8px;
+            padding: 10px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+        }
+        .controls {
+            margin-bottom: 10px;
+        }
+        button {
+            background: #333;
+            color: white;
+            border: 1px solid #555;
+            padding: 8px 16px;
+            border-radius: 4px;
+            cursor: pointer;
+            margin-right: 8px;
+        }
+        button:hover {
+            background: #444;
+        }
+        button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+    </style>
+</head>
+<body>
+    <h1>Interactive Terminal</h1>
+    
+    <div class="controls">
+        <button id="connect-btn">Connect</button>
+        <button id="disconnect-btn" disabled>Disconnect</button>
+        <button id="clear-btn">Clear</button>
+    </div>
+    
+    <div class="terminal-container">
+        <div id="terminal"></div>
+    </div>
+
+    <script type="module">
+        import { Terminal } from 'https://cdn.jsdelivr.net/npm/xterm@5/+esm';
+        import { FitAddon } from 'https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/+esm';
+        import { WebLinksAddon } from 'https://cdn.jsdelivr.net/npm/@xterm/addon-web-links@0.12.0/+esm';
+
+        class TerminalApp {
+            constructor() {
+                this.terminal = null;
+                this.websocket = null;
+                this.ptyId = null;
+                this.fitAddon = null;
+                
+                this.setupTerminal();
+                this.setupEventListeners();
+            }
+
+            setupTerminal() {
+                // Create xterm.js terminal
+                this.terminal = new Terminal({
+                    cursorBlink: true,
+                    fontSize: 14,
+                    fontFamily: 'Monaco, Menlo, "Ubuntu Mono", monospace',
+                    theme: {
+                        background: '#000000',
+                        foreground: '#ffffff',
+                        cursor: '#ffffff',
+                        selection: '#444444',
+                        black: '#000000',
+                        red: '#ff5555',
+                        green: '#50fa7b',
+                        yellow: '#f1fa8c',
+                        blue: '#bd93f9',
+                        magenta: '#ff79c6',
+                        cyan: '#8be9fd',
+                        white: '#bbbbbb'
+                    }
+                });
+
+                // Add addons
+                this.fitAddon = new FitAddon();
+                this.terminal.loadAddon(this.fitAddon);
+                this.terminal.loadAddon(new WebLinksAddon());
+
+                // Open terminal in DOM
+                this.terminal.open(document.getElementById('terminal'));
+                this.fitAddon.fit();
+
+                // Handle terminal input
+                this.terminal.onData((data) => {
+                    if (this.websocket && this.websocket.readyState === WebSocket.OPEN) {
+                        this.websocket.send(JSON.stringify({
+                            type: 'input',
+                            data: data
+                        }));
+                    }
+                });
+
+                // Handle terminal resize
+                this.terminal.onResize(({ cols, rows }) => {
+                    if (this.websocket && this.websocket.readyState === WebSocket.OPEN) {
+                        this.websocket.send(JSON.stringify({
+                            type: 'resize',
+                            cols: cols,
+                            rows: rows
+                        }));
+                    }
+                });
+
+                // Handle window resize
+                window.addEventListener('resize', () => {
+                    this.fitAddon.fit();
+                });
+            }
+
+            setupEventListeners() {
+                document.getElementById('connect-btn').onclick = () => this.connect();
+                document.getElementById('disconnect-btn').onclick = () => this.disconnect();
+                document.getElementById('clear-btn').onclick = () => this.terminal.clear();
+            }
+
+            async connect() {
+                try {
+                    // Create PTY session
+                    const response = await fetch('/api/terminal', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json'
+                        },
+                        body: JSON.stringify({
+                            cols: this.terminal.cols,
+                            rows: this.terminal.rows
+                        })
+                    });
+
+                    const result = await response.json();
+                    if (!result.success) {
+                        throw new Error(result.message || 'Failed to create terminal');
+                    }
+
+                    this.ptyId = result.ptyId;
+
+                    // Establish WebSocket connection
+                    const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+                    this.websocket = new WebSocket(`${protocol}//${location.host}/ws`);
+
+                    this.websocket.onopen = () => {
+                        // Connect to PTY
+                        this.websocket.send(JSON.stringify({
+                            type: 'connect',
+                            ptyId: this.ptyId
+                        }));
+
+                        this.updateConnectionState(true);
+                        this.terminal.writeln('\\r\\n\\x1b[32mConnected to terminal\\x1b[0m\\r\\n');
+                    };
+
+                    this.websocket.onmessage = (event) => {
+                        const message = JSON.parse(event.data);
+                        this.handleWebSocketMessage(message);
+                    };
+
+                    this.websocket.onclose = () => {
+                        this.updateConnectionState(false);
+                        this.terminal.writeln('\\r\\n\\x1b[31mConnection closed\\x1b[0m\\r\\n');
+                    };
+
+                    this.websocket.onerror = (error) => {
+                        console.error('WebSocket error:', error);
+                        this.terminal.writeln('\\r\\n\\x1b[31mConnection error\\x1b[0m\\r\\n');
+                    };
+
+                } catch (error) {
+                    console.error('Failed to connect:', error);
+                    this.terminal.writeln(`\\r\\n\\x1b[31mError: ${error.message}\\x1b[0m\\r\\n`);
+                }
+            }
+
+            disconnect() {
+                if (this.websocket) {
+                    this.websocket.close();
+                    this.websocket = null;
+                }
+                this.updateConnectionState(false);
+            }
+
+            handleWebSocketMessage(message) {
+                switch (message.type) {
+                    case 'output':
+                        this.terminal.write(message.data);
+                        break;
+
+                    case 'exit':
+                        this.terminal.writeln(`\\r\\n\\x1b[33mProcess exited with code ${message.exitCode}\\x1b[0m\\r\\n`);
+                        break;
+
+                    case 'error':
+                        this.terminal.writeln(`\\r\\n\\x1b[31mError: ${message.message}\\x1b[0m\\r\\n`);
+                        break;
+                }
+            }
+
+            updateConnectionState(connected) {
+                document.getElementById('connect-btn').disabled = connected;
+                document.getElementById('disconnect-btn').disabled = !connected;
+            }
+        }
+
+        // Initialize the app
+        new TerminalApp();
+    </script>
+</body>
+</html>
+```
+
+</TypeScriptExample>
+
+## Enhanced features
+
+### Add collaboration support
+
+Enable multiple users to share the same terminal session:
+
+<TypeScriptExample>
+
+```ts
+// In your Worker, modify the WebSocket handler
+const sessions = new Map<string, Set<WebSocket>>();
+
+async function handleCollaborativeTerminal(websocket: WebSocket, ptyId: string, env: Env) {
+  // Add user to session
+  if (!sessions.has(ptyId)) {
+    sessions.set(ptyId, new Set());
+  }
+  sessions.get(ptyId)!.add(websocket);
+
+  const sandbox = getSandbox(env.Sandbox, 'terminal-sandbox');
+  const pty = await sandbox.pty.getById(ptyId);
+
+  // Broadcast output to all connected users
+  pty.onData((data) => {
+    const sessionSockets = sessions.get(ptyId);
+    if (sessionSockets) {
+      sessionSockets.forEach(ws => {
+        if (ws.readyState === WebSocket.READY_STATE_OPEN) {
+          ws.send(JSON.stringify({ type: 'output', data }));
+        }
+      });
+    }
+  });
+
+  // Handle user input (any user can type)
+  websocket.addEventListener('message', async (event) => {
+    const message = JSON.parse(event.data as string);
+    if (message.type === 'input') {
+      await pty.write(message.data);
+      
+      // Broadcast typing indicator
+      const sessionSockets = sessions.get(ptyId);
+      sessionSockets?.forEach(ws => {
+        if (ws !== websocket && ws.readyState === WebSocket.READY_STATE_OPEN) {
+          ws.send(JSON.stringify({ 
+            type: 'user_typing', 
+            user: message.userId 
+          }));
+        }
+      });
+    }
+  });
+
+  // Clean up on disconnect
+  websocket.addEventListener('close', () => {
+    sessions.get(ptyId)?.delete(websocket);
+  });
+}
+```
+
+</TypeScriptExample>
+
+### Add terminal recording
+
+Capture and replay terminal sessions:
+
+<TypeScriptExample>
+
+```ts
+class TerminalRecorder {
+  private events: Array<{ timestamp: number; type: 'output' | 'input'; data: string }> = [];
+  private startTime: number = Date.now();
+
+  recordOutput(data: string) {
+    this.events.push({
+      timestamp: Date.now() - this.startTime,
+      type: 'output',
+      data: data
+    });
+  }
+
+  recordInput(data: string) {
+    this.events.push({
+      timestamp: Date.now() - this.startTime,
+      type: 'input', 
+      data: data
+    });
+  }
+
+  async replay(terminal: Terminal, speed: number = 1) {
+    for (const event of this.events) {
+      await new Promise(resolve => setTimeout(resolve, event.timestamp / speed));
+      
+      if (event.type === 'output') {
+        terminal.write(event.data);
+      }
+    }
+  }
+
+  export(): string {
+    return JSON.stringify({
+      version: 1,
+      startTime: this.startTime,
+      events: this.events
+    });
+  }
+
+  static import(data: string): TerminalRecorder {
+    const parsed = JSON.parse(data);
+    const recorder = new TerminalRecorder();
+    recorder.events = parsed.events;
+    recorder.startTime = parsed.startTime;
+    return recorder;
+  }
+}
+```
+
+</TypeScriptExample>
+
+## Testing your terminal
+
+Deploy your application:
+
+<PackageManagers
+  type="exec"
+  pkg="wrangler dev"
+/>
+
+Open your browser and navigate to your local development URL. You should see:
+
+1. **Terminal Interface**: A web-based terminal with xterm.js rendering
+2. **Real-time I/O**: Commands execute immediately with live output streaming
+3. **Terminal Features**: Support for colors, cursor movement, and control sequences
+4. **Resize Handling**: Terminal automatically adapts to window size changes
+
+## Advanced use cases
+
+### Development environments
+
+Create cloud-based development environments:
+
+<TypeScriptExample>
+
+```ts
+// Set up development environment
+const setupDevEnvironment = async (sandbox: Sandbox) => {
+  // Install tools
+  await sandbox.exec('apt-get update && apt-get install -y git vim tmux');
+  
+  // Clone repository
+  await sandbox.exec('git clone https://github.com/user/project.git /workspace');
+  
+  // Set up environment
+  await sandbox.exec('cd /workspace && npm install');
+  
+  // Create PTY with project context
+  const pty = await sandbox.pty.create({
+    cwd: '/workspace',
+    env: {
+      NODE_ENV: 'development',
+      EDITOR: 'vim'
+    }
+  });
+  
+  return pty;
+};
+```
+
+</TypeScriptExample>
+
+### Educational platforms
+
+Build interactive coding tutorials:
+
+<TypeScriptExample>
+
+```ts
+class CodingTutorial {
+  constructor(private sandbox: Sandbox) {}
+
+  async startLesson(lessonId: string) {
+    // Set up lesson environment
+    await this.sandbox.exec(`curl -o /tmp/lesson-${lessonId}.sh https://tutorials.com/${lessonId}.sh`);
+    await this.sandbox.exec(`chmod +x /tmp/lesson-${lessonId}.sh`);
+    await this.sandbox.exec(`/tmp/lesson-${lessonId}.sh`);
+    
+    // Create guided PTY session
+    const pty = await this.sandbox.pty.create({
+      cwd: `/lessons/${lessonId}`,
+      command: ['bash', '--init-file', '/lessons/tutorial.bashrc']
+    });
+    
+    // Provide hints and validation
+    pty.onData((output) => {
+      if (output.includes('ERROR')) {
+        this.showHint('Try checking your syntax');
+      }
+      if (output.includes('SUCCESS')) {
+        this.advanceToNextStep();
+      }
+    });
+    
+    return pty;
+  }
+}
+```
+
+</TypeScriptExample>
+
+## Next steps
+
+You have successfully built an interactive terminal using Cloudflare Sandbox PTY functionality. Consider these enhancements:
+
+- **File editor integration**: Combine PTY with file operations for a full IDE experience
+- **Multi-pane terminals**: Support tabbed or split terminal layouts
+- **Terminal sharing**: Generate shareable links for collaborative sessions
+- **Persistent sessions**: Save and restore terminal state across page reloads
+- **Custom themes**: Allow users to customize terminal appearance
+- **Keyboard shortcuts**: Implement common terminal shortcuts and hotkeys
+
+For more advanced PTY usage patterns, see the [PTY API reference](/sandbox/api/pty/).
